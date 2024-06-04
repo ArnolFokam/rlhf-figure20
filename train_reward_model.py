@@ -24,9 +24,86 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=8, help="Training batch size")
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Evaluation batch size")
     parser.add_argument("--max_seq_len", type=int, default=128, help="Maximum sequence length")
-    parser.add_argument("--log_every_n_steps", type=int, default=10, help="Log every n steps")
+    parser.add_argument("--log_every_n_steps", type=int, default=1, help="Log every n steps")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     return parser.parse_args()
+
+
+class HHPreferencesDatasets:
+    def __init__(self,  tokenizer, max_seq_len, split) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        dataset = load_dataset("Anthropic/hh-rlhf", split=split)
+        self.dataset = dataset.map(
+            self._preprocess_sequence_pairs,
+            num_proc=4,
+            batched=True,
+            remove_columns=dataset.column_names,
+        )
+
+        pass
+
+    def _preprocess_sequence_pairs(self, examples):
+        chosen_tokenized = self.tokenizer(
+            examples["chosen"],
+            padding="max_length",
+            max_length=self.max_seq_len,
+            truncation=True,
+            return_tensors="np",
+        )
+        rejected_tokenized = self.tokenizer(
+            examples["rejected"],
+            padding="max_length",
+            max_length=self.max_seq_len,
+            truncation=True,
+            return_tensors="np",
+        )
+        return {
+            "chosen_input_ids": chosen_tokenized["input_ids"],
+            "chosen_attention_mask": chosen_tokenized["attention_mask"],
+            "rejected_input_ids": rejected_tokenized["input_ids"],
+            "rejected_attention_mask": rejected_tokenized["attention_mask"],
+        }
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+    def __len__(self):
+        return len(self.dataset)
+    
+# Custom dataset class for the training data
+class SentimentPreferencesDataset(HHPreferencesDatasets):
+    
+    def __init__(self,  tokenizer, max_seq_len, split) -> None:
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        
+        if split == "train":
+            slice = ":4000"
+        elif split == "test":
+            slice = "4000:5300"
+        else:
+            raise ValueError("split must be either 'train' or 'test'")
+
+        dataset = load_dataset("OEvortex/SentimentSynth", split=f"train[{slice}]")
+    
+        self.dataset = dataset.map(
+            self._preprocess_sequence_pairs,
+            num_proc=4,
+            remove_columns=dataset.column_names,
+        )
+
+        pass
+
+    def _preprocess_sequence_pairs(self, examples):
+        # This piece of code only works when the processing is not batched.
+        examples['chosen'] = '\n\nHuman: '+examples['prompt']+'\n\nAssistant: '+examples['chosen']
+        examples['rejected'] = '\n\nHuman: '+examples['prompt']+'\n\nAssistant: '+examples['rejected']
+        
+        examples = super()._preprocess_sequence_pairs(examples)
+
+        return {k:v[0] for k, v in examples.items()}
+
 
 # Custom DataLoader class for JAX
 class JaxDataloader:
@@ -135,7 +212,7 @@ def evaluate(epoch, dataloader, state, args, writer):
             eval_metrics.append(eval_metric)
             progress_bar_eval.update(1)
 
-        eval_metrics = jax.tree.map(lambda *x: jnp.array(x), *eval_metrics)
+        eval_metrics = jax.tree_util.tree_map(lambda *x: jnp.array(x), *eval_metrics)
         eval_metrics = jax.tree.map(jnp.mean, eval_metrics)
 
         progress_bar_eval.set_description(
@@ -143,7 +220,7 @@ def evaluate(epoch, dataloader, state, args, writer):
         )
 
         for key, value in eval_metrics.items():
-            writer.add_scalar(f"eval/{key}", round(float(value), 3), (epoch + 1) * len(dataloader))
+            writer.add_scalar(f"eval/{key}", round(float(value), 3), 0)
 
 # Training step
 @jax.jit
@@ -168,16 +245,17 @@ def train_step(state, batch):
 # Training function for a single epoch
 def train_single_epoch(epoch, dataloader, state, args, writer):
     with tqdm(total=len(dataloader), desc="Training ", leave=False) as progress_bar_train:
-        for step, batch in enumerate(dataloader, 1):
+        for step, batch in enumerate(dataloader):
             state, train_metrics = train_step(state, batch)
             progress_bar_train.update(1)
             progress_bar_train.set_description(
                 f"Training ({epoch}/{args.num_epochs}) | Loss: {round(train_metrics['loss'].mean(), 3)} | Accuracy: {train_metrics['accuracy']}"
             )
 
-            if ((epoch + 1) * len(dataloader) + step) % args.log_every_n_steps == 0:
+            if (epoch * len(dataloader) + step) % args.log_every_n_steps == 0:
                 for key, value in train_metrics.items():
-                    writer.add_scalar(f"train/{key}", round(float(value), 3), (epoch + 1) * len(dataloader))
+                    writer.add_scalar(f"train/{key}", round(float(value), 3), epoch * len(dataloader) + step)
+
     return state
 
 if __name__ == "__main__":
@@ -194,47 +272,25 @@ if __name__ == "__main__":
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
-    tokenizer.pad_token = tokenizer.bos_token
+    tokenizer.pad_token = tokenizer.bos_token # TODO: fix this to a better padding token
 
     # Initialize datasets
-    raw_hh_dataset = load_dataset("Anthropic/hh-rlhf")
-
-    # Preprocess function for sequence pairs
-    def preprocess_sequence_pairs(examples):
-        chosen_tokenized = tokenizer(
-            examples["chosen"],
-            padding="max_length",
-            max_length=args.max_seq_len,
-            truncation=True,
-            return_tensors="np",
-        )
-        rejected_tokenized = tokenizer(
-            examples["rejected"],
-            padding="max_length",
-            max_length=args.max_seq_len,
-            truncation=True,
-            return_tensors="np",
-        )
-        return {
-            "chosen_input_ids": chosen_tokenized["input_ids"],
-            "chosen_attention_mask": chosen_tokenized["attention_mask"],
-            "rejected_input_ids": rejected_tokenized["input_ids"],
-            "rejected_attention_mask": rejected_tokenized["attention_mask"],
-        }
-
-    # Tokenize datasets
-    tokenized_hh_dataset = raw_hh_dataset.map(
-        preprocess_sequence_pairs,
-        num_proc=4,
-        batched=True,
-        remove_columns=raw_hh_dataset["train"].column_names,
+    train_dataset = SentimentPreferencesDataset(
+        tokenizer=tokenizer, 
+        max_seq_len=args.max_seq_len, 
+        split="train",
+    )
+    test_dataset = SentimentPreferencesDataset(
+        tokenizer=tokenizer, 
+        max_seq_len=args.max_seq_len, 
+        split="test",
     )
 
     # Initialize training DataLoader
     rng, train_iter_rng = jax.random.split(rng, 2)
     train_dataloader = JaxDataloader(
         rng=train_iter_rng,
-        dataset=tokenized_hh_dataset["train"],
+        dataset=train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
     )
@@ -249,7 +305,7 @@ if __name__ == "__main__":
 
     # Evaluate model
     eval_dataloader = JaxDataloader(
-        dataset=tokenized_hh_dataset["test"],
+        dataset=test_dataset,
         batch_size=args.eval_batch_size,
     )
 
