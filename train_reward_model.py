@@ -19,6 +19,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="HH & PM vs Specialized Skills Experiments")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
     parser.add_argument("--model_name", type=str, default="distilbert/distilgpt2", help="Model name or path")
+    parser.add_argument("--logs_dir", type=str, default="logs", help="Log directory")
     parser.add_argument("--experiment_name", type=str, default="base_hh_rlfh_data", help="Experiment name")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--train_batch_size", type=int, default=8, help="Training batch size")
@@ -161,7 +162,7 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(args.seed)
 
     # Initialize logging
-    summary_writer = SummaryWriter(f"logs/{args.experiment_name}_{args.seed}")
+    summary_writer = SummaryWriter(f"{args.logs_dir}/{args.experiment_name}_{args.seed}")
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
