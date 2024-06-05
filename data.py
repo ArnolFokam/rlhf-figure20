@@ -45,6 +45,7 @@ class HHPreferencesDatasets:
             batched=True,
             remove_columns=dataset.column_names,
         )
+        pass
 
     @staticmethod
     def preprocess_sequence_pairs(examples, tokenizer, max_seq_len):

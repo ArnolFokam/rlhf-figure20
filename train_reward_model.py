@@ -6,7 +6,10 @@ from typing import NamedTuple
 import jax
 import flax
 import optax
+import orbax
+import orbax.checkpoint
 import jax.numpy as jnp
+from flax.training import orbax_utils
 from flax.training.train_state import TrainState
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, FlaxAutoModelForCausalLM
@@ -18,7 +21,7 @@ from data import JaxDataloader, datasets
 def parse_args():
     parser = argparse.ArgumentParser(description="HH & PM vs Specialized Skills Experiments")
     parser.add_argument("--num_epochs", type=int, default=1, help="Number of training epochs")
-    parser.add_argument("--model_name", type=str, default="distilbert/distilgpt2", help="Model name or path")
+    parser.add_argument("--model_name", type=str, default="openai-community/gpt2", help="Model name or path")
     parser.add_argument("--logs_dir", type=str, default="logs", help="Log directory")
     parser.add_argument("--experiment_name", type=str, default="base_hh_rlfh_data", help="Experiment name")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -26,8 +29,8 @@ def parse_args():
     parser.add_argument("--eval_batch_size", type=int, default=32, help="Evaluation batch size")
     parser.add_argument("--max_seq_len", type=int, default=128, help="Maximum sequence length")
     parser.add_argument("--log_every_n_steps", type=int, default=1, help="Log every n steps")
-    parser.add_argument("--train_dataset", type=str, default="mix", help="Training dataset", choices=["hh-rlhf", "sentiment", "mix"])
-    parser.add_argument("--eval_dataset", type=str, default="sentiment", help="Training dataset", choices=["hh-rlhf", "sentiment", "mix"])
+    parser.add_argument("--train_dataset", type=str, default="hh-rlhf", help="Training dataset", choices=["hh-rlhf", "sentiment", "mix"])
+    parser.add_argument("--eval_dataset", type=str, default="hh-rlhf", help="Training dataset", choices=["hh-rlhf", "sentiment", "mix"])
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
     return parser.parse_args()
 
@@ -109,9 +112,6 @@ def train_single_epoch(epoch, dataloader, state, args, writer):
                 for key, value in train_metrics.items():
                     writer.add_scalar(f"train/{key}", round(float(value), 3), epoch * len(dataloader) + step)
 
-            if step == 10:
-                break
-
     return state
 
 # Evaluation step
@@ -162,7 +162,8 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(args.seed)
 
     # Initialize logging
-    summary_writer = SummaryWriter(f"{args.logs_dir}/{args.experiment_name}_{args.seed}")
+    logs_dir = f"{args.logs_dir}/{args.experiment_name}_{args.seed}"
+    summary_writer = SummaryWriter(logs_dir)
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
@@ -204,3 +205,9 @@ if __name__ == "__main__":
     )
 
     eval_acc = evaluate(args=args, state=state, dataloader=eval_dataloader, writer=summary_writer)
+
+    # save model
+    ckpt = {"reward_model": state, "args": vars(args)}
+    orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ckpt)
+    orbax_checkpointer.save(args.save_path, ckpt, save_args=save_args, force=True)
