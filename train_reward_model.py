@@ -1,5 +1,6 @@
 import logging
 import argparse
+import os
 from tqdm import tqdm
 from typing import NamedTuple
 
@@ -115,7 +116,7 @@ def train_single_epoch(epoch, dataloader, state, args, writer):
     return state
 
 # Evaluation step
-@jax.jit
+# @jax.jit
 def eval_step(state, batch):
     chosen_input_ids = batch["chosen_input_ids"]
     rejected_input_ids = batch["rejected_input_ids"]
@@ -154,7 +155,27 @@ def evaluate(dataloader, state, args, writer):
 
 if __name__ == "__main__":
 
-    args = parse_args()
+    # args = parse_args()
+
+    args = argparse.Namespace(
+        num_epochs=1,
+        model_name="sshleifer/tiny-gpt2",
+        logs_dir="logs",
+        experiment_name="pm_sentiment",
+        learning_rate=1e-4,
+        train_batch_size=256,
+        eval_batch_size=16,
+        max_seq_len=1024,
+        log_every_n_steps=10,
+        train_dataset="sentiment",
+        eval_dataset="sentiment",
+        seed=3
+    )
+    args.experiment_name = f"{args.experiment_name}_{args.max_seq_len}_{args.seed}_{args.train_dataset}_{args.eval_dataset}"
+
+    # seq len 256 512 1024
+    # seed 0 1 2
+    # data: hh/sent, sent/sent
 
     logging.info(f"Train and evaluate preference model with seed {args.seed}")
 
@@ -162,12 +183,12 @@ if __name__ == "__main__":
     rng = jax.random.PRNGKey(args.seed)
 
     # Initialize logging
-    logs_dir = f"{args.logs_dir}/{args.experiment_name}_{args.seed}"
+    logs_dir = f"{args.logs_dir}/{args.experiment_name}"
     summary_writer = SummaryWriter(logs_dir)
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
-    tokenizer.pad_token = tokenizer.bos_token # TODO: fix this to a better padding token
+    tokenizer.pad_token = tokenizer.bos_token
 
     # Initialize datasets
     train_dataset = datasets[args.train_dataset](
@@ -210,4 +231,4 @@ if __name__ == "__main__":
     ckpt = {"reward_model": state, "args": vars(args)}
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(ckpt)
-    orbax_checkpointer.save(args.save_path, ckpt, save_args=save_args, force=True)
+    orbax_checkpointer.save(os.path.abspath(f"{logs_dir}/model/"), ckpt, save_args=save_args, force=True)
