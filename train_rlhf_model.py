@@ -233,26 +233,31 @@ if __name__ == "__main__":
         # get original query response pairs
         query_responses_ids = jnp.concatenate([batch_prompts["input_ids"], responses], axis=1)
         attention_mask = jnp.concatenate([batch_prompts["attention_mask"], jnp.ones_like(responses)], axis=1)
-        
-        # get logprobs of action over sequence of state (active policy)
-        logprobs, values = policy_forward(
+        context_length = batch_prompts["input_ids"].shape[1]
+
+        # get logprobs of action over responses (active policy)
+        logits, values = policy_forward(
             params=policy_state.params,
             x={
                 "input_ids": query_responses_ids,
                 "attention_mask": attention_mask,
-            },
+            }, # but perform pass over query/response
         )
+        all_logprobs = jax.nn.log_softmax(logits[:, context_length:] / args.temperature, axis=-1)
+        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], axis=-1).squeeze()
 
-        # get logprobs of action over sequence of state (reference policy)
-        ref_logprobs, _ = policy_forward(
+        # get logprobs of action over responses (reference policy)
+        ref_logits, _ = policy_forward(
             params=initial_policy_ref_params,
             x={
                 "input_ids": query_responses_ids,
                 "attention_mask": attention_mask,
-            },
-        )
-
-        pass
+            }, # but perform pass over query/response
+        )        
+        ref_all_logprobs = jax.nn.log_softmax(ref_logits[:, context_length:] / args.temperature, axis=-1)
+        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], axis=-1).squeeze()
+        
+        # TODO: implement GAE, rewards, KL etc
         
        
 
