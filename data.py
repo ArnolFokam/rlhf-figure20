@@ -26,7 +26,11 @@ class JaxDataloader:
 
         for idx in batch_idx:
             batch = self.dataset[idx]
-            batch = {k: jnp.array(v) for k, v in batch.items()}
+            for k, v in batch.items():
+                if not isinstance(v[0], str):
+                    batch[k] = jnp.array(v)
+                else:
+                    batch[k] = v
             yield batch
 
     def __len__(self):
@@ -45,7 +49,6 @@ class HHPreferencesDatasets:
             batched=True,
             remove_columns=dataset.column_names,
         )
-        pass
 
     @staticmethod
     def preprocess_sequence_pairs(examples, tokenizer, max_seq_len):
@@ -152,8 +155,47 @@ class HHSentimentMixPreferencesDataset(HHPreferencesDatasets):
     def sentiment_preprocess_sequence_pairs(examples, tokenizer, max_seq_len):
         return SentimentPreferencesDataset.preprocess_sequence_pairs(examples, tokenizer, max_seq_len)
 
-datasets = {
+
+# custom dataset class for Sentiment prompts data
+class SentimentsPromptsDatasets:
+    def __init__(self, args, tokenizer) -> None:
+        self.max_query_length = args.max_query_length
+        dataset = load_dataset("OEvortex/SentimentSynth", split="train")
+        self.dataset = dataset.map(
+            lambda x: self.preprocess_sequence(x, tokenizer, self.max_query_length),
+            num_proc=4,
+            batched=True,
+            remove_columns=dataset.column_names,
+        )
+
+    @staticmethod
+    def preprocess_sequence(examples, tokenizer, max_query_length):
+        prompt_tokenized = tokenizer(
+            examples["prompt"],
+            padding="max_length",
+            max_length=max_query_length,
+            return_tensors="np",
+            truncation=True,
+        )
+        return {
+            "query": examples["prompt"],
+            "input_ids": prompt_tokenized["input_ids"],
+            "attention_mask": prompt_tokenized["attention_mask"],
+        }
+
+    def __getitem__(self, idx):
+        return self.dataset[idx]
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+pm_datasets = {
     "hh-rlhf": HHPreferencesDatasets,
     "sentiment": SentimentPreferencesDataset,
     "mix": HHSentimentMixPreferencesDataset,
+}
+
+prompts_datasets = {
+    "sentiment": SentimentsPromptsDatasets,
 }
