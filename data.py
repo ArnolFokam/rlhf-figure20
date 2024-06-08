@@ -26,11 +26,7 @@ class JaxDataloader:
 
         for idx in batch_idx:
             batch = self.dataset[idx]
-            for k, v in batch.items():
-                if not isinstance(v[0], str):
-                    batch[k] = jnp.array(v)
-                else:
-                    batch[k] = v
+            batch = {k: jnp.array(v) for k, v in batch.items()}
             yield batch
 
     def __len__(self):
@@ -164,12 +160,13 @@ class SentimentsPromptsDatasets:
         self.dataset = dataset.map(
             lambda x: self.preprocess_sequence(x, tokenizer, self.max_query_length),
             num_proc=4,
-            batched=True,
             remove_columns=dataset.column_names,
         )
 
     @staticmethod
     def preprocess_sequence(examples, tokenizer, max_query_length):
+        examples["prompt"] = "\n\nHuman: " + examples["prompt"] + "\n\nAssistant: "
+        
         prompt_tokenized = tokenizer(
             examples["prompt"],
             padding="max_length",
@@ -177,10 +174,10 @@ class SentimentsPromptsDatasets:
             return_tensors="np",
             truncation=True,
         )
+
         return {
-            "query": examples["prompt"],
-            "input_ids": prompt_tokenized["input_ids"],
-            "attention_mask": prompt_tokenized["attention_mask"],
+            "input_ids": prompt_tokenized["input_ids"][0],
+            "attention_mask": prompt_tokenized["attention_mask"][0],
         }
 
     def __getitem__(self, idx):
