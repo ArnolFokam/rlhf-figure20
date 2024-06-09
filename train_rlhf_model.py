@@ -3,9 +3,8 @@ import logging
 import argparse
 import os
 import copy
+from random import shuffle
 from tqdm import tqdm
-from typing import NamedTuple
-from dataclasses import dataclass
 
 import jax
 import flax
@@ -16,18 +15,44 @@ import orbax.checkpoint
 import jax.numpy as jnp
 from flax.training import orbax_utils
 from flax.training.train_state import TrainState
-from torch.utils.tensorboard import SummaryWriter
+from flax.metrics.tensorboard import SummaryWriter
 from transformers import AutoTokenizer, FlaxAutoModelForCausalLM, GenerationConfig
 
-from model import LMBackboneWithScalarHeadParams, RegressionHead
 from data import JaxDataloader, prompts_datasets as datasets
+from model import LMBackboneWithScalarHeadParams, RegressionHead
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="HH & PM vs Specialized Skills Experiments (RLHF)"
+    )
+    parser.add_argument(
+        "--saved_pm_path",
+        type=str,
+        default="logs/pm_sentiment_sentiment_1024_0/model",
+        help="Directory of the saved reward model",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed",
+    )
+
+    return parser.parse_args()
 
 
 # Function to create training state
 def create_policy_train_state(args, rng):
-    backbone = FlaxAutoModelForCausalLM.from_pretrained(args.model_name, dtype=jnp.float16)
+    backbone = FlaxAutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        dtype=jnp.bfloat16,
+    )
     backbone.params = backbone.to_bf16(backbone.params)
-    head = RegressionHead(head_input_size=backbone.config.hidden_size)
+    head = RegressionHead(
+        head_input_size=backbone.config.hidden_size,
+        param_dtype=jnp.bfloat16,
+    )
 
     # Create generation config
     generation_config = GenerationConfig(
@@ -36,12 +61,12 @@ def create_policy_train_state(args, rng):
         temperature=args.temperature,
         top_k=args.generation_topk,
         top_p=args.generation_topp,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=args.pad_token_id,
         do_sample=True,
     )
 
     # Function that generates the responses
-    def policy_generate(params: LMBackboneWithScalarHeadParams, x):
+    def _policy_generate(params: LMBackboneWithScalarHeadParams, x):
         input_ids, attention_mask = x["input_ids"], x["attention_mask"]
         prompt_length = input_ids.shape[1]
         return backbone.generate(
@@ -53,7 +78,7 @@ def create_policy_train_state(args, rng):
         ).sequences[:, prompt_length:]
 
     # Function that computes the values of the responses
-    def policy_forward(params: LMBackboneWithScalarHeadParams, x):
+    def _policy_forward(params: LMBackboneWithScalarHeadParams, x):
         input_ids, attention_mask = x["input_ids"], x["attention_mask"]
         position_ids = attention_mask.cumsum(1) - attention_mask
         output = backbone.module.apply(
@@ -81,31 +106,38 @@ def create_policy_train_state(args, rng):
             eps=1e-8,
             weight_decay=0.01,
         ),
-        every_k_schedule=args.ppo_gradient_accumulation_steps
+        every_k_schedule=args.ppo_gradient_accumulation_steps,
     )
 
     # Initialize policy state
+    head_params = head.init(rng, jnp.ones(backbone.config.hidden_size)[None, None, :])
+    head_params = jax.tree_util.tree_map(lambda x: x.astype(jnp.bfloat16), head_params)
     state = TrainState.create(
-        apply_fn=policy_forward,
+        apply_fn=_policy_forward,
         params=LMBackboneWithScalarHeadParams(
             backbone_params=flax.core.FrozenDict({"params": backbone.params}),
-            head_params=flax.core.FrozenDict(
-                head.init(rng, jnp.ones(backbone.config.hidden_size)[None, None, :])
-            ),
+            head_params=flax.core.FrozenDict(head_params),
         ),
         tx=optimizer,
     )
 
-    return policy_forward, policy_generate, state
+    return _policy_forward, _policy_generate, state
+
 
 # Function to get the reward model
-def get_reward_fn(args, rng):
-    backbone = FlaxAutoModelForCausalLM.from_pretrained(args.model_name, dtype=jnp.float16)
+def get_reward_fn(args, _):
+    backbone = FlaxAutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        dtype=jnp.bfloat16,
+    )
     backbone.params = backbone.to_bf16(backbone.params)
-    head = RegressionHead(head_input_size=backbone.config.hidden_size)
+    head = RegressionHead(
+        head_input_size=backbone.config.hidden_size,
+        param_dtype=jnp.bfloat16,
+    )
 
     # Function that computes the reward
-    def get_reward(params: LMBackboneWithScalarHeadParams, x):
+    def _get_reward(params: LMBackboneWithScalarHeadParams, x):
         query_responses_ids, attention_mask = x["input_ids"], x["attention_mask"]
         position_ids = attention_mask.cumsum(1) - attention_mask
         reward_latents = backbone.module.apply(
@@ -121,68 +153,349 @@ def get_reward_fn(args, rng):
 
     # load the saved model weights
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-    state_params = orbax_checkpointer.restore(args.saved_pm_path)["reward_model"]["params"]
+    state_params = orbax_checkpointer.restore(args.saved_pm_path)["reward_model"][
+        "params"
+    ]
     params = LMBackboneWithScalarHeadParams(
-        backbone_params=flax.core.FrozenDict({"params": state_params["backbone_params"]["params"]}),
-        head_params=flax.core.FrozenDict({"params": state_params["head_params"]["params"]}),
+        backbone_params=flax.core.FrozenDict(
+            {"params": state_params["backbone_params"]["params"]}
+        ),
+        head_params=flax.core.FrozenDict(
+            {"params": state_params["head_params"]["params"]}
+        ),
     )
     logging.info(f"Loaded pretrained reward model from {args.saved_pm_path}")
 
-    return functools.partial(get_reward, params)
-    
-# Function to computer advantages and returns
-def compute_advantages_and_returns(rewards, values, dones, gamma, lamda):
+    return functools.partial(_get_reward, params)
 
-    def gae_at_t(carry, inp):
-        gae, next_value = carry
-        done, reward, value = inp
 
-        delta = reward + gamma * next_value * (1 - done) - value 
-        gae = delta + gamma * lamda * (1 - done) * gae
+# Function to update the policy
+def get_update_fn(args, rng):
 
-        return (gae, value), gae
+    # Initialize policy model with reference policy
+    rng, policy_init_rng = jax.random.split(rng, 2)
+    policy_forward, policy_generate, policy_state = create_policy_train_state(
+        args, policy_init_rng
+    )
+    initial_policy_ref_params = copy.deepcopy(policy_state.params)
 
-    _, advantages = jax.lax.scan(
-        gae_at_t,
-        (jnp.zeros((values.shape[0],)), jnp.zeros((values.shape[0],))),
-        xs=(dones.T, rewards.T, values.T),
-        reverse=True
+    # Initialize reward model
+    rng, reward_init_rng = jax.random.split(rng, 2)
+    reward_fn = get_reward_fn(args, reward_init_rng)
+
+    # Compute number of mini-batches for
+    # PPO update and metrics normalization
+    args.num_ppo_mini_batches = (
+        args.prompts_batch_size // args.ppo_gradient_accumulation_steps
     )
 
-    # retunrs (advantages, returns)
-    return advantages.T, advantages.T + values
+    # Function to computer advantages and returns
+    def _compute_advantages_and_returns(rewards, values, dones, gamma, lamda):
 
-    
+        def _gae_at_t(carry, inp):
+            gae, next_value = carry
+            done, reward, value = inp
+
+            delta = reward + gamma * next_value * (1 - done) - value
+            gae = delta + gamma * lamda * (1 - done) * gae
+
+            return (gae, value), gae
+
+        _, advantages = jax.lax.scan(
+            _gae_at_t,
+            (
+                jnp.zeros((values.shape[0],), dtype=jnp.bfloat16),
+                jnp.zeros((values.shape[0],), dtype=jnp.bfloat16),
+            ),
+            xs=(
+                dones.T,
+                rewards.T,
+                values.T,
+            ),  # transpose [batch, time] to [time, batch]
+            reverse=True,
+        )
+
+        # retunrs (advantages, returns)
+        return advantages.T, advantages.T + values
+
+    @jax.jit
+    def update_fn(policy_state, x, update_rng):
+
+        # generate responses
+        responses = policy_generate(
+            params=policy_state.params,
+            x=x,
+        )
+
+        # get original query response pairs
+        query_responses_ids = jnp.concatenate([x["input_ids"], responses], axis=1)
+        attention_mask = jnp.concatenate(
+            [x["attention_mask"], jnp.ones_like(responses, dtype=jnp.bfloat16)], axis=1
+        )
+        context_length = x["input_ids"].shape[1]
+
+        # computer reward from function
+        scores = reward_fn(
+            x={
+                "input_ids": query_responses_ids,
+                "attention_mask": attention_mask,
+            }
+        ).squeeze()
+
+        #### PPO UPDATE ####
+
+        # get logprobs of action over responses (reference policy)
+        ref_logits, _ = policy_forward(
+            params=initial_policy_ref_params,
+            x={
+                "input_ids": query_responses_ids,
+                "attention_mask": attention_mask,
+            },  # but perform pass over query/response
+        )
+        ref_all_logprobs = jax.nn.log_softmax(
+            ref_logits[:, context_length:] / args.temperature, axis=-1
+        )
+        ref_logprobs = jnp.take_along_axis(
+            ref_all_logprobs, responses[..., None], axis=-1
+        ).squeeze()
+
+        # get logprobs of action over responses (active policy)
+        logits, values = policy_forward(
+            params=policy_state.params,
+            x={
+                "input_ids": query_responses_ids,
+                "attention_mask": attention_mask,
+            },  # but perform pass over query/response
+        )
+        all_logprobs = jax.nn.log_softmax(
+            logits[:, context_length:] / args.temperature, axis=-1
+        )
+        logprobs = jnp.take_along_axis(
+            all_logprobs, responses[..., None], axis=-1
+        ).squeeze()
+
+        # Compute KL-Div penalty between active and reference policy
+        kl_div = logprobs - ref_logprobs
+        rewards = -args.ppo_kl_coeff * kl_div
+
+        # Compute advantage and returns
+        rewards = rewards.at[:, -1].add(
+            scores
+        )  # add score of query/response to last step
+        values = values[:, context_length:].squeeze()  # extract values from response
+
+        dones = jnp.zeros_like(rewards, dtype=jnp.bfloat16)
+        dones = dones.at[:, -1].set(1.0)  # set last step as done
+
+        advantages, returns = _compute_advantages_and_returns(
+            rewards=rewards,
+            values=values,
+            dones=dones,
+            gamma=args.ppo_gamma,
+            lamda=args.ppo_lamda,
+        )
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Create transition batch for PPO update
+        transition_batch = (
+            query_responses_ids,
+            attention_mask,
+            advantages,
+            logprobs,
+            returns,
+            values,
+        )
+
+        # Function to update the policy parameters
+        def _update_epoch(carry, _):
+
+            def _update_minibatch(carry, inp):
+                policy_state, metrics = carry
+                (
+                    query_responses_ids,
+                    attention_mask,
+                    advantages,
+                    logprobs,
+                    returns,
+                    values,
+                ) = inp
+
+                def _loss_fn(params):
+                    logits_new, values_new = policy_state.apply_fn(
+                        params,
+                        x={
+                            "input_ids": query_responses_ids,
+                            "attention_mask": attention_mask,
+                        },
+                    )
+
+                    # Calculate critic loss
+                    values_new = values_new[:, context_length:].squeeze()
+                    values_new_clipped = values + jnp.clip(
+                        values_new - values,
+                        -args.ppo_epsilon_clip,
+                        args.ppo_epsilon_clip,
+                    )
+                    value_losses = jnp.square(values_new - returns)
+                    value_losses_clip = jnp.square(values_new_clipped - returns)
+                    critic_loss = (
+                        0.5 * jnp.maximum(value_losses, value_losses_clip).mean()
+                    )
+
+                    # Calculate actor loss
+                    responses = query_responses_ids[:, context_length:]
+                    logprobs_new = jax.nn.log_softmax(
+                        logits_new[:, context_length:] / args.temperature, axis=-1
+                    )
+                    logprobs_new = jnp.take_along_axis(
+                        logprobs_new, responses[..., None], axis=-1
+                    ).squeeze()
+                    logprobs_diff = logprobs_new - logprobs
+                    ratio = jnp.exp(logprobs_diff)
+                    actor_loss1 = ratio * advantages
+                    actor_loss2 = (
+                        jnp.clip(
+                            ratio,
+                            1 - args.ppo_epsilon_clip,
+                            1 + args.ppo_epsilon_clip,
+                        )
+                        * advantages
+                    )
+                    actor_loss = -jnp.minimum(actor_loss1, actor_loss2).mean()
+
+                    # Get total loss
+                    loss = actor_loss + args.ppo_vf_coef * critic_loss
+
+                    # Get metrics
+                    current_metrics = dict(
+                        actor_loss=actor_loss,
+                        critic_loss=critic_loss,
+                        total_loss=loss,
+                        ratio=ratio.mean(),
+                        approxkl=0.5 * (logprobs_diff**2).mean(),
+                        value_losses=value_losses.mean(),
+                        actor_loss1=actor_loss1.mean(),
+                    )
+
+                    return loss, current_metrics
+
+                # Update policy parameters with minibatch
+                loss_grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
+                (_, current_metrics), grads = loss_grad_fn(policy_state.params)
+                policy_state = policy_state.apply_gradients(grads=grads)
+
+                # merge metrics from current minibatch
+                metrics = jax.tree_util.tree_map(
+                    lambda x, y: x + y, metrics, current_metrics
+                )
+
+                return (policy_state, metrics), None
+
+            policy_state, metrics, rng = carry
+            rng, permutation_rng = jax.random.split(rng, 2)
+            permutation = jax.random.permutation(
+                permutation_rng, args.prompts_batch_size
+            )
+
+            # Shuffle batch per epoch update
+            shuffled_transition_batch = jax.tree_util.tree_map(
+                lambda x: jnp.take(x, permutation, axis=0), transition_batch
+            )
+
+            # Split the batch into multiple mini-batches
+            mini_batches = jax.tree_util.tree_map(
+                lambda x: einops.rearrange(
+                    x, "(m b) l -> m b l", m=args.num_ppo_mini_batches
+                ),
+                shuffled_transition_batch,
+            )
+
+            # Update the policy with each mini-batch
+            (policy_state, metrics), _ = jax.lax.scan(
+                f=_update_minibatch,
+                init=(policy_state, metrics),
+                xs=mini_batches,
+            )
+
+            return (policy_state, metrics, rng), None
+
+        # Multiple optimization epochs
+        metrics = dict(
+            actor_loss=0.0,
+            critic_loss=0.0,
+            total_loss=0.0,
+            ratio=0.0,
+            approxkl=0.0,
+            value_losses=0.0,
+            actor_loss1=0.0,
+        )
+        (policy_state, metrics, _), _ = jax.lax.scan(
+            f=_update_epoch,
+            init=(policy_state, metrics, update_rng),
+            xs=None,
+            length=args.ppo_num_epochs_per_batch,
+        )
+
+        # Normalize metrics w.r.t number of epochs and mini-batches
+        metrics = jax.tree_util.tree_map(
+            lambda x: x / (args.ppo_num_epochs_per_batch * args.num_ppo_mini_batches),
+            metrics,
+        )
+
+        # Add metrics concerning the rewards
+        metrics.update(
+            dict(
+                mean_score=scores.mean(),
+                kl_div_initial=kl_div.mean(),
+            )
+        )
+
+        # Get samples and their scores
+        samples = dict(
+            prompts=x["input_ids"],
+            responses=responses,
+            scores=scores,
+        )
+
+        return policy_state, metrics, samples
+
+    return policy_state, update_fn
+
 
 if __name__ == "__main__":
-    # args = parse_args()
-    
+
+    passed_args = parse_args()
+
     args = argparse.Namespace(
         logs_dir="logs",
         model_name="distilbert/distilgpt2",
         experiment_name="rlhf_sentiment",
         prompts_dataset="sentiment",
-        prompts_batch_size=8,
-        max_query_length=768,
+        prompts_batch_size=64,
+        max_query_length=128,
         min_response_length=128,
         max_response_length=128,
         generation_topk=0.0,
         generation_topp=1.0,
-        num_episodes=100,
+        num_episodes=5000,
         temperature=0.7,
         saved_pm_path="logs/pm_sentiment_sentiment_1024_0/model",
+        log_every_n_episodes=10,
         seed=0,
-
         # ppo training params
-        ppo_gamma=0.99,
+        ppo_gamma=1.00,
         ppo_lamda=0.95,
-        ppo_vf_coef=0.5,
-        ppo_cliprange=0.2,
-        ppo_kl_coeff=0.001,
-        ppo_learning_rate=1e-4,
+        ppo_vf_coef=0.10,
+        ppo_kl_coeff=0.15,
+        ppo_epsilon_clip=0.2,
+        ppo_learning_rate=1e-5,
         ppo_num_epochs_per_batch=4,
-        ppo_gradient_accumulation_steps=2,
+        ppo_gradient_accumulation_steps=1,
     )
+
+    args.experiment_name = f"{args.experiment_name}_{args.saved_pm_path.split('/')[-2]}_{args.seed}"
+    args.saved_pm_path = passed_args.saved_pm_path
+    args.seed = passed_args.seed
 
     logging.info(f"Performing RLHF with seed {args.seed}")
 
@@ -192,10 +505,12 @@ if __name__ == "__main__":
     # Initialize logging
     logs_dir = f"{args.logs_dir}/{args.experiment_name}"
     summary_writer = SummaryWriter(logs_dir)
+    summary_writer.hparams(vars(args))
 
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, padding_side="left")
     tokenizer.pad_token = tokenizer.bos_token
+    args.pad_token_id = tokenizer.pad_token_id
 
     # Initialize training DataLoader
     rng, train_iter_rng = jax.random.split(rng, 2)
@@ -210,208 +525,14 @@ if __name__ == "__main__":
     )
     train_prompts_dataloader_iter = iter(train_prompts_dataloader)
 
-    # Initialize policy model with reference policy
-    rng, policy_state_rng = jax.random.split(rng, 2)
-    policy_forward, policy_generate, policy_state = create_policy_train_state(args, policy_state_rng)
-    initial_policy_ref_params = copy.deepcopy(policy_state.params)
+    # Initialize update function
+    policy_state, rlhf_update = get_update_fn(args, rng)
 
-    # Initialize reward model
-    reward_fn = get_reward_fn(args, rng)
+    # RLHF training loop
+    for episode in tqdm(
+        range(1, args.num_episodes + 1), desc="Episode ", position=0, leave=True
+    ):
 
-    @jax.jit
-    def rlhf_update(policy_state):
-        # generate responses
-        responses = policy_generate(
-            params=policy_state.params,
-            x=batch_prompts,
-        )
-
-        # get original query response pairs
-        query_responses_ids = jnp.concatenate([batch_prompts["input_ids"], responses], axis=1)
-        attention_mask = jnp.concatenate([batch_prompts["attention_mask"], jnp.ones_like(responses)], axis=1)
-        context_length = batch_prompts["input_ids"].shape[1]
-
-        # computer reward from function
-        scores = reward_fn(x={
-            "input_ids": query_responses_ids,
-            "attention_mask": attention_mask,
-        }).squeeze()
-
-        #### PPO UPDATE ####
-
-        # get logprobs of action over responses (active policy)
-        logits, values = policy_forward(
-            params=policy_state.params,
-            x={
-                "input_ids": query_responses_ids,
-                "attention_mask": attention_mask,
-            }, # but perform pass over query/response
-        )
-        all_logprobs = jax.nn.log_softmax(logits[:, context_length:] / args.temperature, axis=-1)
-        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], axis=-1).squeeze()
-        
-        # get logprobs of action over responses (reference policy)
-        ref_logits, _ = policy_forward(
-            params=initial_policy_ref_params,
-            x={
-                "input_ids": query_responses_ids,
-                "attention_mask": attention_mask,
-            }, # but perform pass over query/response
-        )        
-        ref_all_logprobs = jax.nn.log_softmax(ref_logits[:, context_length:] / args.temperature, axis=-1)
-        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], axis=-1).squeeze()
-        
-        # Compute KL-Div penalty between active and reference policy
-        rewards = - args.ppo_kl_coeff * (logprobs - ref_logprobs)
-
-        # Compute advantage and returns
-        rewards = rewards.at[:, -1].add(scores) # add score of query/response to last step
-        values = values[:, context_length:].squeeze()  # extract values from response     
-        
-        dones = jnp.zeros_like(rewards)
-        dones = dones.at[:, -1].set(1.0) # set last step as done
-
-        advantages, returns = compute_advantages_and_returns(
-            rewards=rewards,
-            values=values,
-            dones=dones,
-            gamma=args.ppo_gamma,
-            lamda=args.ppo_lamda,
-        )
-
-        def ppo_step(
-            policy_state,
-            mb_advantages,
-            mb_returns,
-            mb_values,
-            mb_query_responses,
-            mb_logprobs,
-            args,
-        ):
-            def loss(params):
-                logits, vpred_temp = policy_state.apply_fn(
-                    params, 
-                    {
-                        "input_ids": mb_query_responses,
-                        "attention_mask": (mb_query_responses != tokenizer.pad_token_id).astype(jnp.int32),
-                    }
-                )
-                # vpred_temp: [local_micro_batch_size, query_length + response_length, 1]
-                vpred = jnp.squeeze(vpred_temp[:, args.max_query_length- 1 : -1, :], axis=-1)
-                # vpred: [local_micro_batch_size, response_length]
-                vpredclipped = jnp.clip(
-                    vpred,
-                    mb_values - args.ppo_cliprange,
-                    mb_values + args.ppo_cliprange,
-                )
-                vf_losses1 = jnp.square(vpred - mb_returns)
-                vf_losses2 = jnp.square(vpredclipped - mb_returns)
-                vf_loss = 0.5 * jnp.maximum(vf_losses1, vf_losses2).mean()
-                vf_clipfrac = (vf_losses2 > vf_losses1).astype(jnp.float32).mean()
-
-                logits = logits[:, args.max_query_length - 1 : -1, :]
-                logits /= args.temperature
-                responses = mb_query_responses[:, args.max_query_length :]
-                new_logprobs = optax.softmax_cross_entropy_with_integer_labels(logits, responses)
-
-                logprobs_diff = new_logprobs - mb_logprobs
-                ratio = jnp.exp(logprobs_diff)
-                pg_losses1 = -mb_advantages * ratio
-                pg_losses2 = -mb_advantages * jnp.clip(ratio, 1.0 - args.ppo_cliprange, 1.0 + args.ppo_cliprange)
-                pg_loss = jnp.maximum(pg_losses1, pg_losses2).mean()
-                pg_clipfrac = (pg_losses2 > pg_losses1).astype(jnp.float32).mean()
-
-                pd = jax.nn.softmax(logits, axis=-1)
-                entropy = jax.nn.logsumexp(logits, axis=-1) - jnp.sum(pd * logits, axis=-1)
-
-                approxkl = 0.5 * ((logprobs_diff) ** 2).mean()
-                loss = pg_loss + args.ppo_vf_coef * vf_loss
-
-                current_rl_stats = dict(
-                    approxkl=approxkl,
-                    entropy=entropy.mean(),
-                    ratio=ratio.mean(),
-                    pg_loss=pg_loss,
-                    pg_clipfrac=pg_clipfrac,
-                    vf_loss1=vf_losses1.mean(),
-                    vf_loss=vf_loss,
-                    vf_clipfrac=vf_clipfrac,
-                    loss=loss,
-                )
-                return loss, current_rl_stats
-
-            (_, current_rl_stats), grads = jax.value_and_grad(loss, has_aux=True)(policy_state.params)
-            policy_state = policy_state.apply_gradients(grads=grads)
-
-            return policy_state
-
-        def ppo_single_microbatch(carry, inp):
-            policy_state, = carry
-            mb_advantages, mb_returns, mb_values, mb_query_responses, mb_logprobs = inp
-
-            policy_state = ppo_step(
-                policy_state=policy_state,
-                mb_advantages=mb_advantages,
-                mb_returns=mb_returns,
-                mb_values=mb_values,
-                mb_query_responses=mb_query_responses,
-                mb_logprobs=mb_logprobs,
-                args=args,
-            )
-            return (policy_state,), None
-
-        def ppo_single_epoch(carry, inp):
-            policy_state, key = carry
-            key, _ = jax.random.split(key, 2)
-            perm = jax.random.permutation(key, args.prompts_batch_size)
-            
-            mbs_advantages = einops.rearrange(
-                advantages[perm],
-                "(c m) l -> c m l",
-                c=args.ppo_gradient_accumulation_steps,
-            )
-            mbs_returns = einops.rearrange(
-                returns[perm],
-                "(c m) l -> c m l",
-                c=args.ppo_gradient_accumulation_steps,
-            )
-            mbs_values = einops.rearrange(values[perm], "(c m) l -> c m l", c=args.ppo_gradient_accumulation_steps)
-            mbs_query_responses = einops.rearrange(
-                query_responses_ids[perm],
-                "(c m) l -> c m l",
-                c=args.ppo_gradient_accumulation_steps,
-            )
-            mbs_logprobs = einops.rearrange(
-                logprobs[perm],
-                "(c m) l -> c m l",
-                c=args.ppo_gradient_accumulation_steps,
-            )
-            (policy_state, ), _ = jax.lax.scan(
-                f=ppo_single_microbatch,
-                init=(policy_state,),
-                xs=(
-                    mbs_advantages,
-                    mbs_returns,
-                    mbs_values,
-                    mbs_query_responses,
-                    mbs_logprobs,
-                ),
-            )
-            return (policy_state, key), None
-
-        # multiple training epochs
-        (policy_state, _), _ = jax.lax.scan(
-            f=ppo_single_epoch,
-            init=(policy_state, rng),
-            xs=None,
-            length=args.ppo_num_epochs_per_batch,
-        )
-
-        return policy_state
-
-    # perform RLHF with PPO
-    for episode in tqdm(range(1, args.num_episodes + 1), desc="Episode ", position=0, leave=True):
-        
         # Indefinitely loop over the prompts dataset
         try:
             batch_prompts = next(train_prompts_dataloader_iter)
@@ -419,20 +540,39 @@ if __name__ == "__main__":
             train_prompts_dataloader_iter = iter(train_prompts_dataloader)
             batch_prompts = next(train_prompts_dataloader_iter)
 
-        # Update RLHF policy
-        policy_state = rlhf_update(policy_state)
+        # Update the RLHF policy
+        rng, rlhf_update_rng = jax.random.split(rng, 2)
+        policy_state, metrics, samples = rlhf_update(
+            x=batch_prompts,
+            policy_state=policy_state,
+            update_rng=rlhf_update_rng,
+        )
+
+        if episode % args.log_every_n_episodes == 0:
+
+            # Log metrics
+            for k, v in metrics.items():
+                summary_writer.scalar(f"{k}", v, step=episode)
+
+            # Log samples
+            for i in range(min(5, len(samples["scores"]))):
+                prompt = tokenizer.decode(
+                    samples["prompts"][i], skip_special_tokens=True
+                )
+                response = tokenizer.decode(
+                    samples["responses"][i], skip_special_tokens=True
+                )
+                summary_writer.text(
+                    f'Episode {episode} - Sample {i} - Score: {float(samples["scores"][i]):.2f}',
+                    f"Prompt: \n{prompt}\n\nResponse: \n{response}",
+                    step=episode,
+                )
 
     # Save the model
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     ckpt = {"rlhf_model": policy_state, "args": vars(args)}
     orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(ckpt)
-    orbax_checkpointer.save(os.path.abspath(f"{logs_dir}/model/"), ckpt, save_args=save_args, force=True)
-
-       
-
-
-
-
-
- 
+    orbax_checkpointer.save(
+        os.path.abspath(f"{logs_dir}/model/"), ckpt, save_args=save_args, force=True
+    )
